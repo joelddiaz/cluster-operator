@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package syncclusterdeployment
+package remotemachineset
 
 import (
 	"testing"
@@ -31,6 +31,9 @@ import (
 	clientgofake "k8s.io/client-go/kubernetes/fake"
 	clientgotesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+
+	clusteropclientfake "github.com/openshift/cluster-operator/pkg/client/clientset_generated/clientset/fake"
+	clusteropinformers "github.com/openshift/cluster-operator/pkg/client/informers_generated/externalversions"
 
 	clusterapiv1 "sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
 	clusterapiclient "sigs.k8s.io/cluster-api/pkg/client/clientset_generated/clientset"
@@ -69,11 +72,12 @@ func newTestController() (
 
 	controller := NewController(
 		informers.Clusteroperator().V1alpha1().ClusterDeployments(),
+		informers.Clusteroperator().V1alpha1().ClusterVersions(),
 		kubeClient,
 		clusterOperatorClient,
 	)
 
-	controller.clustersSynced = alwaysReady
+	controller.clusterDeploymentSynced = alwaysReady
 
 	return controller,
 		informers.Clusteroperator().V1alpha1().ClusterVersions().Informer().GetStore(),
@@ -99,7 +103,40 @@ func newTestRemoteClusterAPIClient() (
 		remoteClient
 }
 
-func TestMachineSetSyncing(t *testing.T) {
+type testContext struct {
+	controller             *Controller
+	clusterDeploymentStore cache.Store
+	clusterVersionStore    cache.Store
+	clusteropclient        *clusteropclientfake.Clientset
+	capiclient             *clusterapiclientfake.Clientset
+	kubeclient             *clientgofake.Clientset
+}
+
+func setupTest() *testContext {
+	kubeClient := &clientgofake.Clientset{}
+	clusteropClient := &clusteropclientfake.Clientset{}
+	capiClient := &clusterapiclientfake.Clientset{}
+
+	clusteropInformers := clusteropinformers.NewSharedInformerFactory(clusteropClient, 0)
+	//clusterapiInformers := clusterapiinformers.NewSharedInformerFactory(capiClient, 0)
+
+	ctx := &testContext{
+		controller: NewController(
+			clusteropInformers.Clusteroperator().V1alpha1().ClusterDeployments(),
+			clusteropInformers.Clusteroperator().V1alpha1().ClusterVersions(),
+			kubeClient,
+			clusteropClient,
+		),
+		clusterDeploymentStore: clusteropInformers.Clusteroperator().V1alpha1().ClusterDeployments().Informer().GetStore(),
+		clusterVersionStore:    clusteropInformers.Clusteroperator().V1alpha1().ClusterVersions().Informer().GetStore(),
+		clusteropclient:        clusteropClient,
+		capiclient:             capiClient,
+		kubeclient:             kubeClient,
+	}
+	return ctx
+}
+
+func TestMachineSetSynching(t *testing.T) {
 	cases := []struct {
 		name              string
 		controlPlaneReady bool
@@ -239,14 +276,20 @@ func TestMachineSetSyncing(t *testing.T) {
 			},
 		},
 	}
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			ctx := setupTest()
+			tLog := ctx.controller.logger
 
-			c, cvStore, cStore, _, _ := newTestController()
+			// set up clusterversions
 			cv := newClusterVer(testClusterVerNS, testClusterVerName, testClusterVerUID)
-			cvStore.Add(cv)
-			tLog := c.logger
+			err := ctx.clusterVersionStore.Add(cv)
+			if err != nil {
+				t.Fatalf("Error storing clusterversion object: %v", err)
+			}
 
+			// set up remote cluster
 			existingObjects := []kruntime.Object{}
 
 			for i := range tc.remoteMachineSets {
@@ -254,17 +297,18 @@ func TestMachineSetSyncing(t *testing.T) {
 			}
 			remoteClusterAPIClient := newTestRemoteClusterAPIClientWithObjects(existingObjects)
 
-			if tc.controlPlaneReady {
-				tc.cluster.Status.ControlPlaneInstalled = true
-				tc.cluster.Status.ClusterAPIInstalled = true
-			}
-			cStore.Add(tc.cluster)
-
-			c.BuildRemoteClient = func(*cov1.ClusterDeployment) (clusterapiclient.Interface, error) {
+			ctx.controller.BuildRemoteClient = func(*cov1.ClusterDeployment) (clusterapiclient.Interface, error) {
 				return remoteClusterAPIClient, nil
 			}
 
-			err := c.syncClusterDeployment(getKey(tc.cluster, t))
+			if tc.controlPlaneReady {
+				tc.cluster.Status.ClusterAPIInstalled = true
+				tc.cluster.Status.ControlPlaneInstalled = true
+			}
+
+			ctx.clusterDeploymentStore.Add(tc.cluster)
+			err = ctx.controller.syncClusterDeployment(getKey(tc.cluster, t))
+
 			if tc.errorExpected != "" {
 				if assert.Error(t, err) {
 					assert.Contains(t, err.Error(), tc.errorExpected)
@@ -277,7 +321,6 @@ func TestMachineSetSyncing(t *testing.T) {
 			validateUnexpectedActions(t, tLog, remoteClusterAPIClient.Actions(), tc.unexpectedActions)
 		})
 	}
-
 }
 
 func validateExpectedActions(t *testing.T, tLog log.FieldLogger, actions []clientgotesting.Action, expectedActions []expectedRemoteAction) {
@@ -376,6 +419,11 @@ func newTestCluster() *cov1.ClusterDeployment {
 			UID:       testClusterUUID,
 		},
 		Spec: cov1.ClusterDeploymentSpec{
+			Hardware: cov1.ClusterHardwareSpec{
+				AWS: &cov1.AWSClusterSpec{
+					Region: testRegion,
+				},
+			},
 			MachineSets: []cov1.ClusterMachineSet{
 				cov1.ClusterMachineSet{
 					ShortName: "master",
@@ -385,6 +433,10 @@ func newTestCluster() *cov1.ClusterDeployment {
 						Size:     1,
 					},
 				},
+			},
+			ClusterVersionRef: cov1.ClusterVersionReference{
+				Name:      testClusterVerName,
+				Namespace: testClusterVerNS,
 			},
 		},
 	}

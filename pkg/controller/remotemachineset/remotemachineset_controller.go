@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package syncclusterdeployment
+package remotemachineset
 
 import (
 	"bytes"
@@ -65,7 +65,8 @@ const (
 
 // NewController returns a new *Controller.
 func NewController(
-	clusterInformer informers.ClusterDeploymentInformer,
+	clusterDeploymentInformer informers.ClusterDeploymentInformer,
+	clusterVersionInformer informers.ClusterVersionInformer,
 	kubeClient kubeclientset.Interface,
 	clusteroperatorClient coclient.Interface,
 ) *Controller {
@@ -87,12 +88,14 @@ func NewController(
 		logger:     logger,
 	}
 
-	clusterInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	clusterDeploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addCluster,
 		UpdateFunc: c.updateCluster,
 	})
-	c.clusterLister = clusterInformer.Lister()
-	c.clustersSynced = clusterInformer.Informer().HasSynced
+	c.clusterDeploymentLister = clusterDeploymentInformer.Lister()
+	c.clusterDeploymentSynced = clusterDeploymentInformer.Informer().HasSynced
+
+	c.clusterVersionInformer = clusterVersionInformer.Lister()
 
 	c.syncHandler = c.syncClusterDeployment
 	c.enqueueCluster = c.enqueue
@@ -115,15 +118,18 @@ type Controller struct {
 
 	BuildRemoteClient func(*cov1.ClusterDeployment) (clusterapiclient.Interface, error)
 
-	// clusterLister is able to list/get clusters and is populated
+	// clusterDeploymentLister is able to list/get clusters and is populated
 	// by the shared informer passed to NewController.
-	clusterLister lister.ClusterDeploymentLister
-	// clustersSynced returns true if the cluster shared informer
+	clusterDeploymentLister lister.ClusterDeploymentLister
+	// clusterDeploymentSynced returns true if the cluster shared informer
 	// has been synced at least once. Added as a member to the
 	// struct to allow injection for testing.
-	clustersSynced cache.InformerSynced
+	clusterDeploymentSynced cache.InformerSynced
 
-	// Machines that need to be synced
+	// list/get clusterversion objects
+	clusterVersionInformer lister.ClusterVersionLister
+
+	// ClusterDeployments that need to be synced
 	queue workqueue.RateLimitingInterface
 
 	logger log.FieldLogger
@@ -150,7 +156,7 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) {
 	c.logger.Infof("Starting syncclusterdeployment controller")
 	defer c.logger.Infof("Shutting down syncclusterdeployment controller")
 
-	if !controller.WaitForCacheSync("syncclusterdeployment", stopCh, c.clustersSynced) {
+	if !controller.WaitForCacheSync("syncclusterdeployment", stopCh, c.clusterDeploymentSynced) {
 		c.logger.Errorf("could not sync caches for syncclusterdeployment controller")
 		return
 	}
@@ -271,7 +277,7 @@ func (c *Controller) syncClusterDeployment(key string) error {
 		return err
 	}
 
-	cluster, err := c.clusterLister.ClusterDeployments(namespace).Get(name)
+	cluster, err := c.clusterDeploymentLister.ClusterDeployments(namespace).Get(name)
 	if err != nil {
 		c.logger.Errorf("Error fetching cluster %v/%v", namespace, name)
 		return err
@@ -300,12 +306,15 @@ func (c *Controller) syncMachineSets(cluster *cov1.ClusterDeployment) error {
 	remoteMachineSets, err := remoteClusterAPIClient.ClusterV1alpha1().MachineSets(remoteClusterAPINamespace).List(metav1.ListOptions{})
 
 	coVersionNamespace, coVersionName := cluster.Spec.ClusterVersionRef.Namespace, cluster.Spec.ClusterVersionRef.Name
-	coClusterVersion, err := c.client.ClusteroperatorV1alpha1().ClusterVersions(coVersionNamespace).Get(coVersionName, metav1.GetOptions{})
+	coClusterVersion, err := c.clusterVersionInformer.ClusterVersions(coVersionNamespace).Get(coVersionName)
 	if err != nil {
 		return fmt.Errorf("cannot retrieve cluster version %s/%s: %v", coVersionNamespace, coVersionName, err)
 	}
 
-	clusterDeploymentComputeMachineSets := computeClusterAPIMachineSetsFromClusterDeployment(cluster, coClusterVersion)
+	clusterDeploymentComputeMachineSets, err := computeClusterAPIMachineSetsFromClusterDeployment(cluster, coClusterVersion)
+	if err != nil {
+		return err
+	}
 
 	// find items that need updating/creating
 	for _, ms := range clusterDeploymentComputeMachineSets {
@@ -372,20 +381,23 @@ func (c *Controller) syncMachineSets(cluster *cov1.ClusterDeployment) error {
 }
 
 // return list of non-master machinesets from a given ClusterDeployment
-func computeClusterAPIMachineSetsFromClusterDeployment(cluster *cov1.ClusterDeployment, coClusterVersion *cov1.ClusterVersion) []*clusterapiv1.MachineSet {
+func computeClusterAPIMachineSetsFromClusterDeployment(clusterDeployment *cov1.ClusterDeployment, coClusterVersion *cov1.ClusterVersion) ([]*clusterapiv1.MachineSet, error) {
 	machineSets := []*clusterapiv1.MachineSet{}
 
-	for _, ms := range cluster.Spec.MachineSets {
+	for _, ms := range clusterDeployment.Spec.MachineSets {
 		if ms.NodeType == cov1.NodeTypeMaster {
 			continue
 		}
-		newMS, _ := buildClusterAPIMachineSet(&ms, coClusterVersion)
+		newMS, err := buildClusterAPIMachineSet(&ms, &clusterDeployment.Spec, coClusterVersion)
+		if err != nil {
+			return nil, err
+		}
 		machineSets = append(machineSets, newMS)
 	}
-	return machineSets
+	return machineSets, nil
 }
 
-func buildClusterAPIMachineSet(ms *cov1.ClusterMachineSet, clusterVersion *cov1.ClusterVersion) (*clusterapiv1.MachineSet, error) {
+func buildClusterAPIMachineSet(ms *cov1.ClusterMachineSet, clusterDeploymentSpec *cov1.ClusterDeploymentSpec, clusterVersion *cov1.ClusterVersion) (*clusterapiv1.MachineSet, error) {
 	capiMachineSet := clusterapiv1.MachineSet{}
 	capiMachineSet.Name = ms.ShortName
 	capiMachineSet.Namespace = remoteClusterAPINamespace
@@ -393,23 +405,17 @@ func buildClusterAPIMachineSet(ms *cov1.ClusterMachineSet, clusterVersion *cov1.
 	capiMachineSet.Spec.Replicas = &replicas
 	capiMachineSet.Spec.Selector.MatchLabels = map[string]string{"machineset": ms.ShortName}
 
-	/*
-		// TODO: figure out what to do about annotations
-		if machineSet.Annotations == nil {
-			machineSet.Annotations = map[string]string{}
-		}
-		sClusterVersion, err := serializeCOResource(clusterVersion)
-		if err != nil {
-			return nil, err
-		}
-		machineSet.Annotations["cluster-operator.openshift.io/cluster-version"] = string(sClusterVersion)
-	*/
-
 	machineTemplate := clusterapiv1.MachineTemplateSpec{}
 	machineTemplate.Labels = map[string]string{"machineset": ms.ShortName}
 	machineTemplate.Spec.Labels = map[string]string{"machineset": ms.ShortName}
 
 	capiMachineSet.Spec.Template = machineTemplate
+
+	providerConfig, err := controller.MachineProviderConfigFromMachineSetConfig(&ms.MachineSetConfig, clusterDeploymentSpec, clusterVersion)
+	if err != nil {
+		return nil, err
+	}
+	capiMachineSet.Spec.Template.Spec.ProviderConfig.Value = providerConfig
 
 	return &capiMachineSet, nil
 }

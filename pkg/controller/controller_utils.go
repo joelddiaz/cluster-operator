@@ -482,6 +482,37 @@ func MachineProviderConfigFromMachineSetConfig(machineSetConfig *clusteroperator
 	return ClusterAPIMachineProviderConfigFromMachineSetSpec(msSpec)
 }
 
+// PopulateMachineSpec ensures that the MachineSetSpec we use for the machine spec provider config is fully populated with defaults and calculated values based on Cluster Operator specific logic. This can be used both on individual machines, as well as on the MachineTemplateSpec used in MachineSets and MachineDeployments.
+func PopulateMachineSpec(machineSpec *clusterapi.MachineSpec, clusterSpec *clusteroperator.ClusterDeploymentSpec, clusterVersion *clusteroperator.ClusterVersion, mLog log.FieldLogger) error {
+	var msSpec *clusteroperator.MachineSetSpec
+	var err error
+	if machineSpec.ProviderConfig.Value == nil {
+		msSpec = &clusteroperator.MachineSetSpec{}
+	} else {
+		msSpec, err = MachineSetSpecFromClusterAPIMachineSpec(machineSpec)
+		if err != nil {
+			return err
+		}
+	}
+	vmImage, err := getImage(clusterDeploymentSpec, clusterVersion)
+	if err != nil {
+		return nil, err
+	}
+	msSpec.VMImage = *vmImage
+
+	// use cluster defaults for hardware spec if unset:
+	hwSpec, err := ApplyDefaultMachineSetHardwareSpec(msSpec.Hardware, clusterDeploymentSpec.DefaultHardwareSpec)
+	if err != nil {
+		return nil, err
+	}
+	msSpec.Hardware = hwSpec
+
+	// Copy cluster hardware onto the provider config as well. Needed when deleting a cluster in the actuator.
+	msSpec.ClusterHardware = clusterDeploymentSpec.Hardware
+
+	return ClusterAPIMachineProviderConfigFromMachineSetSpec(msSpec)
+}
+
 // getImage returns a specific image for the given machine and cluster version.
 func getImage(clusterSpec *clusteroperator.ClusterDeploymentSpec, clusterVersion *clusteroperator.ClusterVersion) (*clusteroperator.VMImage, error) {
 	if clusterSpec.Hardware.AWS == nil {
