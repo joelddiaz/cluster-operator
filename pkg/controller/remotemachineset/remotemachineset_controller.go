@@ -99,7 +99,7 @@ func NewController(
 
 	c.syncHandler = c.syncClusterDeployment
 	c.enqueueCluster = c.enqueue
-	c.BuildRemoteClient = c.buildRemoteClusterClients
+	c.buildRemoteClient = c.buildRemoteClusterClient
 
 	return c
 }
@@ -116,7 +116,7 @@ type Controller struct {
 	// Used for unit testing
 	enqueueCluster func(cluster *cov1.ClusterDeployment)
 
-	BuildRemoteClient func(*cov1.ClusterDeployment) (clusterapiclient.Interface, error)
+	buildRemoteClient func(*cov1.ClusterDeployment) (clusterapiclient.Interface, error)
 
 	// clusterDeploymentLister is able to list/get clusters and is populated
 	// by the shared informer passed to NewController.
@@ -220,7 +220,7 @@ func isMasterMachineSet(machineSet *cov1.ClusterMachineSet) bool {
 	return machineSet.NodeType == cov1.NodeTypeMaster
 }
 
-func (c *Controller) buildRemoteClusterClients(clusterDeployment *cov1.ClusterDeployment) (clusterapiclient.Interface, error) {
+func (c *Controller) buildRemoteClusterClient(clusterDeployment *cov1.ClusterDeployment) (clusterapiclient.Interface, error) {
 	// Load the kubeconfig secret for communicating with the remote cluster:
 
 	// Step 1: Get the secret ref from the cluster
@@ -289,8 +289,8 @@ func (c *Controller) syncClusterDeployment(key string) error {
 }
 
 // makes sure the remote cluster's MachineSets match the provided ClusterDeployment.Spec.MachineSets[]
-func (c *Controller) syncMachineSets(cluster *cov1.ClusterDeployment) error {
-	if !cluster.Status.ClusterAPIInstalled {
+func (c *Controller) syncMachineSets(clusterDeployment *cov1.ClusterDeployment) error {
+	if !clusterDeployment.Status.ClusterAPIInstalled {
 		c.logger.Debugf(errorMsgClusterAPINotInstalled)
 		return nil
 	}
@@ -299,19 +299,19 @@ func (c *Controller) syncMachineSets(cluster *cov1.ClusterDeployment) error {
 	machineSetsToCreate := []*clusterapiv1.MachineSet{}
 	machineSetsToUpdate := []*clusterapiv1.MachineSet{}
 
-	remoteClusterAPIClient, err := c.BuildRemoteClient(cluster)
+	remoteClusterAPIClient, err := c.buildRemoteClient(clusterDeployment)
 	if err != nil {
 		return err
 	}
 	remoteMachineSets, err := remoteClusterAPIClient.ClusterV1alpha1().MachineSets(remoteClusterAPINamespace).List(metav1.ListOptions{})
 
-	coVersionNamespace, coVersionName := cluster.Spec.ClusterVersionRef.Namespace, cluster.Spec.ClusterVersionRef.Name
+	coVersionNamespace, coVersionName := clusterDeployment.Spec.ClusterVersionRef.Namespace, clusterDeployment.Spec.ClusterVersionRef.Name
 	coClusterVersion, err := c.clusterVersionInformer.ClusterVersions(coVersionNamespace).Get(coVersionName)
 	if err != nil {
 		return fmt.Errorf("cannot retrieve cluster version %s/%s: %v", coVersionNamespace, coVersionName, err)
 	}
 
-	clusterDeploymentComputeMachineSets, err := computeClusterAPIMachineSetsFromClusterDeployment(cluster, coClusterVersion)
+	clusterDeploymentComputeMachineSets, err := computeClusterAPIMachineSetsFromClusterDeployment(clusterDeployment, coClusterVersion)
 	if err != nil {
 		return err
 	}
@@ -388,55 +388,13 @@ func computeClusterAPIMachineSetsFromClusterDeployment(clusterDeployment *cov1.C
 		if ms.NodeType == cov1.NodeTypeMaster {
 			continue
 		}
-		newMS, err := buildClusterAPIMachineSet(&ms, &clusterDeployment.Spec, coClusterVersion)
+		newMS, err := controller.BuildClusterAPIMachineSet(&ms, &clusterDeployment.Spec, coClusterVersion, remoteClusterAPINamespace)
 		if err != nil {
 			return nil, err
 		}
 		machineSets = append(machineSets, newMS)
 	}
 	return machineSets, nil
-}
-
-func buildClusterAPIMachineSet(ms *cov1.ClusterMachineSet, clusterDeploymentSpec *cov1.ClusterDeploymentSpec, clusterVersion *cov1.ClusterVersion) (*clusterapiv1.MachineSet, error) {
-	capiMachineSet := clusterapiv1.MachineSet{}
-	capiMachineSet.Name = ms.ShortName
-	capiMachineSet.Namespace = remoteClusterAPINamespace
-	replicas := int32(ms.Size)
-	capiMachineSet.Spec.Replicas = &replicas
-	capiMachineSet.Spec.Selector.MatchLabels = map[string]string{"machineset": ms.ShortName}
-
-	machineTemplate := clusterapiv1.MachineTemplateSpec{}
-	machineTemplate.Labels = map[string]string{"machineset": ms.ShortName}
-	machineTemplate.Spec.Labels = map[string]string{"machineset": ms.ShortName}
-
-	capiMachineSet.Spec.Template = machineTemplate
-
-	providerConfig, err := controller.MachineProviderConfigFromMachineSetConfig(&ms.MachineSetConfig, clusterDeploymentSpec, clusterVersion)
-	if err != nil {
-		return nil, err
-	}
-	capiMachineSet.Spec.Template.Spec.ProviderConfig.Value = providerConfig
-
-	return &capiMachineSet, nil
-}
-
-func buildClusterAPICluster(cluster *cov1.ClusterDeployment) (*clusterapiv1.Cluster, error) {
-	capiCluster := clusterapiv1.Cluster{}
-	capiCluster.Name = cluster.Name
-	sCluster, err := serializeCOResource(cluster)
-	if err != nil {
-		return nil, err
-	}
-	capiCluster.Spec.ProviderConfig.Value = &runtime.RawExtension{
-		Raw: sCluster,
-	}
-
-	// These are unused, dummy values.
-	capiCluster.Spec.ClusterNetwork.ServiceDomain = "cluster-api.k8s.io"
-	capiCluster.Spec.ClusterNetwork.Pods.CIDRBlocks = []string{"10.10.0.0/16"}
-	capiCluster.Spec.ClusterNetwork.Services.CIDRBlocks = []string{"172.30.0.0/16"}
-
-	return &capiCluster, nil
 }
 
 func serializeCOResource(object runtime.Object) ([]byte, error) {

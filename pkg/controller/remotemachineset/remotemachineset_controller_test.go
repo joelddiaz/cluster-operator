@@ -118,7 +118,6 @@ func setupTest() *testContext {
 	capiClient := &clusterapiclientfake.Clientset{}
 
 	clusteropInformers := clusteropinformers.NewSharedInformerFactory(clusteropClient, 0)
-	//clusterapiInformers := clusterapiinformers.NewSharedInformerFactory(capiClient, 0)
 
 	ctx := &testContext{
 		controller: NewController(
@@ -297,7 +296,7 @@ func TestMachineSetSynching(t *testing.T) {
 			}
 			remoteClusterAPIClient := newTestRemoteClusterAPIClientWithObjects(existingObjects)
 
-			ctx.controller.BuildRemoteClient = func(*cov1.ClusterDeployment) (clusterapiclient.Interface, error) {
+			ctx.controller.buildRemoteClient = func(*cov1.ClusterDeployment) (clusterapiclient.Interface, error) {
 				return remoteClusterAPIClient, nil
 			}
 

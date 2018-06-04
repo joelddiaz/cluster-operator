@@ -334,7 +334,6 @@ func NewControllerInitializers() map[string]InitFunc {
 	controllers["deployclusterapi"] = startDeployClusterAPIController
 	controllers["clusterdeployment"] = startClusterDeploymentController
 	controllers["awselb"] = startAWSELBController
-	controllers["syncmachineset"] = startSyncMachineSetController
 	controllers["remotemachineset"] = startRemoteMachineSetController
 
 	return controllers
@@ -583,9 +582,8 @@ func startRemoteMachineSetController(ctx ControllerContext) (bool, error) {
 		return false, nil
 	}
 	go remotemachineset.NewController(
-		//ctx.InformerFactory.Clusteroperator().V1alpha1.Clusters(),
-		ctx.InformerFactory.Clusteroperator().V1alpha1().ClusterVersions(),
 		ctx.InformerFactory.Clusteroperator().V1alpha1().ClusterDeployments(),
+		ctx.InformerFactory.Clusteroperator().V1alpha1().ClusterVersions(),
 		ctx.ClientBuilder.KubeClientOrDie("clusteroperator-remotemachineset-controller"),
 		ctx.ClientBuilder.ClientOrDie("clusteroperator-remotemachineset-controller"),
 	).Run(int(ctx.Options.ConcurrentRemoteMachineSetSyncs), ctx.Stop)
