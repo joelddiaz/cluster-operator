@@ -482,6 +482,7 @@ func MachineProviderConfigFromMachineSetConfig(machineSetConfig *clusteroperator
 	return ClusterAPIMachineProviderConfigFromMachineSetSpec(msSpec)
 }
 
+/*
 // PopulateMachineSpec ensures that the MachineSetSpec we use for the machine spec provider config is fully populated with defaults and calculated values based on Cluster Operator specific logic. This can be used both on individual machines, as well as on the MachineTemplateSpec used in MachineSets and MachineDeployments.
 func PopulateMachineSpec(machineSpec *clusterapi.MachineSpec, clusterSpec *clusteroperator.ClusterDeploymentSpec, clusterVersion *clusteroperator.ClusterVersion, mLog log.FieldLogger) error {
 	var msSpec *clusteroperator.MachineSetSpec
@@ -512,6 +513,7 @@ func PopulateMachineSpec(machineSpec *clusterapi.MachineSpec, clusterSpec *clust
 
 	return ClusterAPIMachineProviderConfigFromMachineSetSpec(msSpec)
 }
+*/
 
 // getImage returns a specific image for the given machine and cluster version.
 func getImage(clusterSpec *clusteroperator.ClusterDeploymentSpec, clusterVersion *clusteroperator.ClusterVersion) (*clusteroperator.VMImage, error) {

@@ -56,7 +56,7 @@ const (
 	// 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1.3s, 2.6s, 5.1s, 10.2s, 20.4s, 41s, 82s
 	maxRetries = 15
 
-	controllerLogName = "syncclusterdeployment"
+	controllerLogName = "remotemachineset"
 
 	remoteClusterAPINamespace      = "kube-cluster"
 	remoteClusterAPIDeploymentName = "cluster-api-apiserver"
@@ -76,7 +76,7 @@ func NewController(
 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(kubeClient.CoreV1().RESTClient()).Events("")})
 
 	if kubeClient != nil && kubeClient.CoreV1().RESTClient().GetRateLimiter() != nil {
-		metrics.RegisterMetricAndTrackRateLimiterUsage("clusteroperator_syncclusterdeployment_controller", kubeClient.CoreV1().RESTClient().GetRateLimiter())
+		metrics.RegisterMetricAndTrackRateLimiterUsage("clusteroperator_remotemachineset_controller", kubeClient.CoreV1().RESTClient().GetRateLimiter())
 	}
 
 	logger := log.WithField("controller", controllerLogName)
@@ -84,12 +84,12 @@ func NewController(
 	c := &Controller{
 		client:     clusteroperatorClient,
 		kubeClient: kubeClient,
-		queue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncclusterdeployment"),
+		queue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "remotemachineset"),
 		logger:     logger,
 	}
 
 	clusterDeploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    c.addCluster,
+		AddFunc:    c.addClusterDeployment,
 		UpdateFunc: c.updateCluster,
 	})
 	c.clusterDeploymentLister = clusterDeploymentInformer.Lister()
@@ -135,15 +135,15 @@ type Controller struct {
 	logger log.FieldLogger
 }
 
-func (c *Controller) addCluster(obj interface{}) {
+func (c *Controller) addClusterDeployment(obj interface{}) {
 	cluster := obj.(*cov1.ClusterDeployment)
-	c.logger.Debugf("syncclusterdeployment: adding cluster %v", cluster.Name)
+	c.logger.Debugf("remotemachineset: adding cluster %v", cluster.Name)
 	c.enqueueCluster(cluster)
 }
 
 func (c *Controller) updateCluster(old, cur interface{}) {
 	cluster := cur.(*cov1.ClusterDeployment)
-	c.logger.Debugf("syncclusterdeployment: updating cluster %v", cluster.Name)
+	c.logger.Debugf("remotemachineset: updating cluster %v", cluster.Name)
 	c.enqueueCluster(cluster)
 }
 
@@ -153,11 +153,11 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
-	c.logger.Infof("Starting syncclusterdeployment controller")
-	defer c.logger.Infof("Shutting down syncclusterdeployment controller")
+	c.logger.Infof("Starting remotemachineset controller")
+	defer c.logger.Infof("Shutting down remotemachineset controller")
 
-	if !controller.WaitForCacheSync("syncclusterdeployment", stopCh, c.clusterDeploymentSynced) {
-		c.logger.Errorf("could not sync caches for syncclusterdeployment controller")
+	if !controller.WaitForCacheSync("remotemachineset", stopCh, c.clusterDeploymentSynced) {
+		c.logger.Errorf("could not sync caches for remotemachineset controller")
 		return
 	}
 
@@ -168,10 +168,10 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) {
 	<-stopCh
 }
 
-func (c *Controller) enqueue(cluster *cov1.ClusterDeployment) {
-	key, err := controller.KeyFunc(cluster)
+func (c *Controller) enqueue(clusterDeployment *cov1.ClusterDeployment) {
+	key, err := controller.KeyFunc(clusterDeployment)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", cluster, err))
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", clusterDeployment, err))
 		return
 	}
 	c.queue.Add(key)
@@ -203,16 +203,16 @@ func (c *Controller) handleErr(err error, key string) {
 		return
 	}
 
-	logger := c.logger.WithField("machineset", key)
+	logger := c.logger.WithField("clusterdeployment", key)
 
 	if c.queue.NumRequeues(key) < maxRetries {
-		logger.Infof("error syncing machine set: %v", err)
+		logger.Infof("error syncing cluster deployment: %v", err)
 		c.queue.AddRateLimited(key)
 		return
 	}
 
 	utilruntime.HandleError(err)
-	logger.Infof("dropping machine set out of the queue: %v", err)
+	logger.Infof("dropping cluster deployment out of the queue: %v", err)
 	c.queue.Forget(key)
 }
 
@@ -220,7 +220,7 @@ func isMasterMachineSet(machineSet *cov1.ClusterMachineSet) bool {
 	return machineSet.NodeType == cov1.NodeTypeMaster
 }
 
-func (c *Controller) buildRemoteClusterClients(cluster *cov1.ClusterDeployment) (clusterapiclient.Interface, error) {
+func (c *Controller) buildRemoteClusterClients(clusterDeployment *cov1.ClusterDeployment) (clusterapiclient.Interface, error) {
 	// Load the kubeconfig secret for communicating with the remote cluster:
 
 	// Step 1: Get the secret ref from the cluster
@@ -235,10 +235,10 @@ func (c *Controller) buildRemoteClusterClients(cluster *cov1.ClusterDeployment) 
 	// if clusterConfig == nil {
 	// 	return nil, fmt.Errorf("unable to retrieve AdminKubeConfig from cluster status")
 	// }
-	secretName := cluster.Name + "-kubeconfig"
+	secretName := clusterDeployment.Name + "-kubeconfig"
 
 	// Step 2: Retrieve secret
-	secret, err := c.kubeClient.CoreV1().Secrets(cluster.Namespace).Get(secretName, metav1.GetOptions{})
+	secret, err := c.kubeClient.CoreV1().Secrets(clusterDeployment.Namespace).Get(secretName, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -264,12 +264,12 @@ func (c *Controller) buildRemoteClusterClients(cluster *cov1.ClusterDeployment) 
 // This function is not meant to be invoked concurrently with the same key.
 func (c *Controller) syncClusterDeployment(key string) error {
 	startTime := time.Now()
-	c.logger.WithField("key", key).Debug("syncing machineset")
+	c.logger.WithField("key", key).Debug("syncing clusterdeployment")
 	defer func() {
 		c.logger.WithFields(log.Fields{
 			"key":      key,
 			"duration": time.Now().Sub(startTime),
-		}).Debug("finished syncing machineset")
+		}).Debug("finished syncing clusterdeployment")
 	}()
 
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
@@ -277,13 +277,13 @@ func (c *Controller) syncClusterDeployment(key string) error {
 		return err
 	}
 
-	cluster, err := c.clusterDeploymentLister.ClusterDeployments(namespace).Get(name)
+	clusterDeployment, err := c.clusterDeploymentLister.ClusterDeployments(namespace).Get(name)
 	if err != nil {
-		c.logger.Errorf("Error fetching cluster %v/%v", namespace, name)
+		c.logger.Errorf("Error fetching clusterdeployment %v/%v", namespace, name)
 		return err
 	}
 
-	err = c.syncMachineSets(cluster)
+	err = c.syncMachineSets(clusterDeployment)
 
 	return err
 }
