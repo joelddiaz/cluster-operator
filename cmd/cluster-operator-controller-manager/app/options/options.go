@@ -72,6 +72,7 @@ func NewCMServer() *CMServer {
 			ConcurrentDeployClusterAPISyncs:  defaultConcurrentSyncs,
 			ConcurrentELBMachineSyncs:        defaultConcurrentSyncs,
 			ConcurrentClusterDeploymentSyncs: defaultConcurrentSyncs,
+			ConcurrentRemoteMachineSetSyncs:  defaultConcurrentSyncs,
 			LeaderElection:                   leaderelectionconfig.DefaultLeaderElectionConfiguration(),
 			LeaderElectionNamespace:          defaultLeaderElectionNamespace,
 			ControllerStartInterval:          metav1.Duration{Duration: 0 * time.Second},

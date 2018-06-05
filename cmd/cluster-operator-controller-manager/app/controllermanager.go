@@ -584,6 +584,7 @@ func startRemoteMachineSetController(ctx ControllerContext) (bool, error) {
 	go remotemachineset.NewController(
 		ctx.InformerFactory.Clusteroperator().V1alpha1().ClusterDeployments(),
 		ctx.InformerFactory.Clusteroperator().V1alpha1().ClusterVersions(),
+		ctx.ClusterAPIInformerFactory.Cluster().V1alpha1().Clusters(),
 		ctx.ClientBuilder.KubeClientOrDie("clusteroperator-remotemachineset-controller"),
 		ctx.ClientBuilder.ClientOrDie("clusteroperator-remotemachineset-controller"),
 	).Run(int(ctx.Options.ConcurrentRemoteMachineSetSyncs), ctx.Stop)

@@ -17,7 +17,6 @@ limitations under the License.
 package remotemachineset
 
 import (
-	"bytes"
 	"fmt"
 	"time"
 
@@ -25,8 +24,6 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	jsonserializer "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	kubeclientset "k8s.io/client-go/kubernetes"
@@ -36,7 +33,6 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 
-	coapi "github.com/openshift/cluster-operator/pkg/api"
 	cov1 "github.com/openshift/cluster-operator/pkg/apis/clusteroperator/v1alpha1"
 	coclient "github.com/openshift/cluster-operator/pkg/client/clientset_generated/clientset"
 	informers "github.com/openshift/cluster-operator/pkg/client/informers_generated/externalversions/clusteroperator/v1alpha1"
@@ -46,6 +42,8 @@ import (
 
 	clusterapiv1 "sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
 	clusterapiclient "sigs.k8s.io/cluster-api/pkg/client/clientset_generated/clientset"
+	clusterapiinformers "sigs.k8s.io/cluster-api/pkg/client/informers_generated/externalversions/cluster/v1alpha1"
+	clusterapilister "sigs.k8s.io/cluster-api/pkg/client/listers_generated/cluster/v1alpha1"
 )
 
 const (
@@ -59,7 +57,6 @@ const (
 	controllerLogName = "remotemachineset"
 
 	remoteClusterAPINamespace      = "kube-cluster"
-	remoteClusterAPIDeploymentName = "cluster-api-apiserver"
 	errorMsgClusterAPINotInstalled = "cannot sync until cluster API is installed and ready"
 )
 
@@ -67,6 +64,7 @@ const (
 func NewController(
 	clusterDeploymentInformer informers.ClusterDeploymentInformer,
 	clusterVersionInformer informers.ClusterVersionInformer,
+	clusterInformer clusterapiinformers.ClusterInformer,
 	kubeClient kubeclientset.Interface,
 	clusteroperatorClient coclient.Interface,
 ) *Controller {
@@ -90,15 +88,17 @@ func NewController(
 
 	clusterDeploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addClusterDeployment,
-		UpdateFunc: c.updateCluster,
+		UpdateFunc: c.updateClusterDeployment,
 	})
 	c.clusterDeploymentLister = clusterDeploymentInformer.Lister()
 	c.clusterDeploymentSynced = clusterDeploymentInformer.Informer().HasSynced
 
 	c.clusterVersionInformer = clusterVersionInformer.Lister()
 
+	c.clusterInformer = clusterInformer.Lister()
+
 	c.syncHandler = c.syncClusterDeployment
-	c.enqueueCluster = c.enqueue
+	c.enqueueClusterDeployment = c.enqueue
 	c.buildRemoteClient = c.buildRemoteClusterClient
 
 	return c
@@ -114,7 +114,7 @@ type Controller struct {
 	syncHandler func(key string) error
 
 	// Used for unit testing
-	enqueueCluster func(cluster *cov1.ClusterDeployment)
+	enqueueClusterDeployment func(cluster *cov1.ClusterDeployment)
 
 	buildRemoteClient func(*cov1.ClusterDeployment) (clusterapiclient.Interface, error)
 
@@ -129,6 +129,9 @@ type Controller struct {
 	// list/get clusterversion objects
 	clusterVersionInformer lister.ClusterVersionLister
 
+	// list/get clusterapi cluster objects
+	clusterInformer clusterapilister.ClusterLister
+
 	// ClusterDeployments that need to be synced
 	queue workqueue.RateLimitingInterface
 
@@ -138,13 +141,13 @@ type Controller struct {
 func (c *Controller) addClusterDeployment(obj interface{}) {
 	cluster := obj.(*cov1.ClusterDeployment)
 	c.logger.Debugf("remotemachineset: adding cluster %v", cluster.Name)
-	c.enqueueCluster(cluster)
+	c.enqueueClusterDeployment(cluster)
 }
 
-func (c *Controller) updateCluster(old, cur interface{}) {
+func (c *Controller) updateClusterDeployment(old, cur interface{}) {
 	cluster := cur.(*cov1.ClusterDeployment)
 	c.logger.Debugf("remotemachineset: updating cluster %v", cluster.Name)
-	c.enqueueCluster(cluster)
+	c.enqueueClusterDeployment(cluster)
 }
 
 // Run runs c; will not return until stopCh is closed. workers determines how
@@ -174,6 +177,7 @@ func (c *Controller) enqueue(clusterDeployment *cov1.ClusterDeployment) {
 		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", clusterDeployment, err))
 		return
 	}
+	c.logger.Debugf("XXX adding cluster %v", key)
 	c.queue.Add(key)
 }
 
@@ -290,7 +294,17 @@ func (c *Controller) syncClusterDeployment(key string) error {
 
 // makes sure the remote cluster's MachineSets match the provided ClusterDeployment.Spec.MachineSets[]
 func (c *Controller) syncMachineSets(clusterDeployment *cov1.ClusterDeployment) error {
-	if !clusterDeployment.Status.ClusterAPIInstalled {
+	// get clusterapi cluster object
+	clusterapiCluster, err := c.clusterInformer.Clusters(clusterDeployment.Namespace).Get(clusterDeployment.Name)
+	if err != nil {
+		return fmt.Errorf("error retrieving cluster object: %v", err)
+	}
+	clusterDeploymentStatus, err := controller.ClusterStatusFromClusterAPI(clusterapiCluster)
+	if err != nil {
+		return fmt.Errorf("error fetching cluster status: %v", err)
+	}
+
+	if !clusterDeploymentStatus.ClusterAPIInstalled {
 		c.logger.Debugf(errorMsgClusterAPINotInstalled)
 		return nil
 	}
@@ -303,6 +317,7 @@ func (c *Controller) syncMachineSets(clusterDeployment *cov1.ClusterDeployment) 
 	if err != nil {
 		return err
 	}
+	c.logger.Debugf("got remote cluster client: %+v", remoteClusterAPIClient)
 	remoteMachineSets, err := remoteClusterAPIClient.ClusterV1alpha1().MachineSets(remoteClusterAPINamespace).List(metav1.ListOptions{})
 
 	coVersionNamespace, coVersionName := clusterDeployment.Spec.ClusterVersionRef.Namespace, clusterDeployment.Spec.ClusterVersionRef.Name
@@ -350,12 +365,12 @@ func (c *Controller) syncMachineSets(clusterDeployment *cov1.ClusterDeployment) 
 		}
 	}
 
-	c.logger.Debugf("Creating machineset(s) %+v", machineSetsToCreate)
-	c.logger.Debugf("Updating machineset(s) %+v", machineSetsToUpdate)
-	c.logger.Debugf("Deleting machineset(s) %+v", machineSetsToDelete)
+	c.logger.Debugf("Creating %d machineset(s)", len(machineSetsToCreate))
+	c.logger.Debugf("Updating %d machineset(s)", len(machineSetsToUpdate))
+	c.logger.Debugf("Deleting %d machineset(s)", len(machineSetsToDelete))
 
 	for _, ms := range machineSetsToCreate {
-		c.logger.Debugf("creating ms %v", ms)
+		c.logger.Debugf("creating ms %v", ms.Name)
 		_, err = remoteClusterAPIClient.ClusterV1alpha1().MachineSets(remoteClusterAPINamespace).Create(ms)
 		if err != nil {
 			return err
@@ -395,15 +410,4 @@ func computeClusterAPIMachineSetsFromClusterDeployment(clusterDeployment *cov1.C
 		machineSets = append(machineSets, newMS)
 	}
 	return machineSets, nil
-}
-
-func serializeCOResource(object runtime.Object) ([]byte, error) {
-	serializer := jsonserializer.NewSerializer(jsonserializer.DefaultMetaFactory, coapi.Scheme, coapi.Scheme, false)
-	encoder := coapi.Codecs.EncoderForVersion(serializer, cov1.SchemeGroupVersion)
-	buffer := &bytes.Buffer{}
-	err := encoder.Encode(object, buffer)
-	if err != nil {
-		return nil, err
-	}
-	return buffer.Bytes(), nil
 }
