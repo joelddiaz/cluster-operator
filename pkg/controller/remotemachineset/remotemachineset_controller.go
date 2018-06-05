@@ -287,18 +287,23 @@ func (c *Controller) syncClusterDeployment(key string) error {
 		return err
 	}
 
-	err = c.syncMachineSets(clusterDeployment)
-
-	return err
-}
-
-// makes sure the remote cluster's MachineSets match the provided ClusterDeployment.Spec.MachineSets[]
-func (c *Controller) syncMachineSets(clusterDeployment *cov1.ClusterDeployment) error {
-	// get clusterapi cluster object
 	clusterapiCluster, err := c.clusterInformer.Clusters(clusterDeployment.Namespace).Get(clusterDeployment.Name)
 	if err != nil {
 		return fmt.Errorf("error retrieving cluster object: %v", err)
 	}
+
+	err = c.syncMachineSets(clusterDeployment, clusterapiCluster)
+
+	return err
+}
+
+func (c *Controller) syncClusterSpec(clusterDeployment *cov1.ClusterDeployment, clusterapiCluster *clusterapiv1.Cluster) error {
+
+	return nil
+}
+
+// makes sure the remote cluster's MachineSets match the provided ClusterDeployment.Spec.MachineSets[]
+func (c *Controller) syncMachineSets(clusterDeployment *cov1.ClusterDeployment, clusterapiCluster *clusterapiv1.Cluster) error {
 	clusterDeploymentStatus, err := controller.ClusterStatusFromClusterAPI(clusterapiCluster)
 	if err != nil {
 		return fmt.Errorf("error fetching cluster status: %v", err)
@@ -392,6 +397,7 @@ func (c *Controller) syncMachineSets(clusterDeployment *cov1.ClusterDeployment) 
 			return err
 		}
 	}
+
 	return nil
 }
 

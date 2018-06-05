@@ -20,8 +20,6 @@ import (
 	"testing"
 
 	cov1 "github.com/openshift/cluster-operator/pkg/apis/clusteroperator/v1alpha1"
-	coclient "github.com/openshift/cluster-operator/pkg/client/clientset_generated/clientset/fake"
-	informers "github.com/openshift/cluster-operator/pkg/client/informers_generated/externalversions"
 	"github.com/openshift/cluster-operator/pkg/controller"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,34 +56,6 @@ func init() {
 	log.SetLevel(log.DebugLevel)
 }
 
-// newTestController creates a test Controller with fake clients and informers.
-func newTestController() (
-	*Controller,
-	cache.Store, // cluster version store
-	cache.Store, // clusters store
-	*clientgofake.Clientset,
-	*coclient.Clientset,
-) {
-	kubeClient := &clientgofake.Clientset{}
-	clusterOperatorClient := &coclient.Clientset{}
-	informers := informers.NewSharedInformerFactory(clusterOperatorClient, 0)
-
-	controller := NewController(
-		informers.Clusteroperator().V1alpha1().ClusterDeployments(),
-		informers.Clusteroperator().V1alpha1().ClusterVersions(),
-		kubeClient,
-		clusterOperatorClient,
-	)
-
-	controller.clusterDeploymentSynced = alwaysReady
-
-	return controller,
-		informers.Clusteroperator().V1alpha1().ClusterVersions().Informer().GetStore(),
-		informers.Clusteroperator().V1alpha1().ClusterDeployments().Informer().GetStore(),
-		kubeClient,
-		clusterOperatorClient
-}
-
 func newTestRemoteClusterAPIClientWithObjects(objects []kruntime.Object) *clusterapiclientfake.Clientset {
 	remoteClient := clusterapiclientfake.NewSimpleClientset(objects...)
 	return remoteClient
@@ -107,6 +77,7 @@ type testContext struct {
 	controller             *Controller
 	clusterDeploymentStore cache.Store
 	clusterVersionStore    cache.Store
+	clusterStore           cache.Store
 	clusteropclient        *clusteropclientfake.Clientset
 	capiclient             *clusterapiclientfake.Clientset
 	kubeclient             *clientgofake.Clientset
@@ -118,16 +89,19 @@ func setupTest() *testContext {
 	capiClient := &clusterapiclientfake.Clientset{}
 
 	clusteropInformers := clusteropinformers.NewSharedInformerFactory(clusteropClient, 0)
+	clusterapiInformers := clusterapiinformers.NewSharedInformerFactory(capiClient, 0)
 
 	ctx := &testContext{
 		controller: NewController(
 			clusteropInformers.Clusteroperator().V1alpha1().ClusterDeployments(),
 			clusteropInformers.Clusteroperator().V1alpha1().ClusterVersions(),
+			clusterapiInformers.Cluster().V1alpha1().Clusters(),
 			kubeClient,
 			clusteropClient,
 		),
 		clusterDeploymentStore: clusteropInformers.Clusteroperator().V1alpha1().ClusterDeployments().Informer().GetStore(),
 		clusterVersionStore:    clusteropInformers.Clusteroperator().V1alpha1().ClusterVersions().Informer().GetStore(),
+		clusterStore:           clusterapiInformers.Cluster().V1alpha1().Clusters().Informer().GetStore(),
 		clusteropclient:        clusteropClient,
 		capiclient:             capiClient,
 		kubeclient:             kubeClient,
@@ -288,7 +262,7 @@ func TestMachineSetSynching(t *testing.T) {
 				t.Fatalf("Error storing clusterversion object: %v", err)
 			}
 
-			// set up remote cluster
+			// set up remote cluster objects
 			existingObjects := []kruntime.Object{}
 
 			for i := range tc.remoteMachineSets {
@@ -304,6 +278,15 @@ func TestMachineSetSynching(t *testing.T) {
 				tc.cluster.Status.ClusterAPIInstalled = true
 				tc.cluster.Status.ControlPlaneInstalled = true
 			}
+
+			// create cluster api cluster object
+			capiCluster := newCapiCluster(tc.cluster)
+			providerStatus, err := controller.ClusterAPIProviderStatusFromClusterStatus(&tc.cluster.Status)
+			if err != nil {
+				t.Fatalf("failed to get providerstaus from clusterdeployment")
+			}
+			capiCluster.Status.ProviderStatus = providerStatus
+			ctx.clusterStore.Add(capiCluster)
 
 			ctx.clusterDeploymentStore.Add(tc.cluster)
 			err = ctx.controller.syncClusterDeployment(getKey(tc.cluster, t))
@@ -369,6 +352,28 @@ func getKey(cluster *cov1.ClusterDeployment, t *testing.T) string {
 		return ""
 	}
 	return key
+}
+
+func newCapiCluster(clusterDeployment *cov1.ClusterDeployment) *clusterapiv1.Cluster {
+	cluster := &clusterapiv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterDeployment.Name,
+			Namespace: clusterDeployment.Namespace,
+		},
+		Spec: clusterapiv1.ClusterSpec{
+			ClusterNetwork: clusterapiv1.ClusterNetworkingConfig{
+				Services: clusterapiv1.NetworkRanges{
+					CIDRBlocks: []string{"172.30.0.0/16"},
+				},
+				ServiceDomain: "svc.clsuter.local",
+				Pods: clusterapiv1.NetworkRanges{
+					CIDRBlocks: []string{"10.128.0.0/14"},
+				},
+			},
+		},
+	}
+
+	return cluster
 }
 
 // newClusterVer will create an actual ClusterVersion for the given reference.
