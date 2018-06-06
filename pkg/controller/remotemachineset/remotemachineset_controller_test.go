@@ -83,6 +83,7 @@ type testContext struct {
 	kubeclient             *clientgofake.Clientset
 }
 
+// Sets up all of the mocks, informers, cache, etc for tests.
 func setupTest() *testContext {
 	kubeClient := &clientgofake.Clientset{}
 	clusteropClient := &clusteropclientfake.Clientset{}
@@ -109,6 +110,93 @@ func setupTest() *testContext {
 	return ctx
 }
 
+func TestClusterSyncing(t *testing.T) {
+
+	cases := []struct {
+		name              string
+		controlPlaneReady bool
+		errorExpected     string
+		expectedActions   []expectedRemoteAction
+		unexpectedActions []expectedRemoteAction
+		clusterDeployment *cov1.ClusterDeployment
+		remoteClusters    []clusterapiv1.Cluster
+	}{
+		{
+			name: "test cluster create",
+			expectedActions: []expectedRemoteAction{
+				{
+					namespace: remoteClusterAPINamespace,
+					verb:      "create",
+					gvr:       clusterapiv1.SchemeGroupVersion.WithResource("cluster"),
+				},
+			},
+			clusterDeployment: newTestClusterDeployment(true),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// :ASSEMBLE:
+			// Setup the mocks, informers, etc
+			ctx := setupTest()
+
+			// We need to be able to see what the controller is logging to validate the process happened.
+			tLog := ctx.controller.logger
+
+			// set up a fake cov1.ClusterVersion so that when the controller runs, the object is available.
+			cv := newClusterVer(testClusterVerNS, testClusterVerName, testClusterVerUID)
+			err := ctx.clusterVersionStore.Add(cv)
+			if err != nil {
+				// Tell the test runner that we've failed. This ends the test.
+				t.Fatalf("Error storing clusterversion object: %v", err)
+			}
+
+			// set up remote cluster objects (generic list basically)
+			existingObjects := []kruntime.Object{}
+
+			// If the tc data contains definitions for remoteClusters, then add them to existingObjects.
+			for i := range tc.remoteClusters {
+				existingObjects = append(existingObjects, &tc.remoteClusters[i]) // For implicit conversion, must be done this way.
+			}
+
+			// Using our list of kruntime objects, create a clusterapi client mock
+			remoteClusterAPIClient := newTestRemoteClusterAPIClientWithObjects(existingObjects)
+
+			// Override the remotemachineset controller's buildRemoteClient function to use our mock instead.
+			ctx.controller.buildRemoteClient = func(*cov1.ClusterDeployment) (clusterapiclient.Interface, error) {
+				return remoteClusterAPIClient, nil
+			}
+
+			// create cluster api cluster object
+			capiCluster, err := newCapiCluster(tc.clusterDeployment)
+			if err != nil {
+				t.Fatalf("failed to get providerstaus from clusterdeployment: %v", err)
+			}
+
+			// Mock that the informer's cache has a cluster api cluster object in it.
+			ctx.clusterStore.Add(capiCluster)
+
+			// Mock that the informer's cache has a cluster opertaor cluster deployment in it.
+			ctx.clusterDeploymentStore.Add(tc.clusterDeployment)
+
+			// :ACT:
+			err = ctx.controller.syncClusterDeployment(getKey(tc.clusterDeployment, t))
+
+			// :ASSERT:
+			if tc.errorExpected != "" {
+				if assert.Error(t, err) {
+					assert.Contains(t, err.Error(), tc.errorExpected)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+
+			validateExpectedActions(t, tLog, remoteClusterAPIClient.Actions(), tc.expectedActions)
+			validateUnexpectedActions(t, tLog, remoteClusterAPIClient.Actions(), tc.unexpectedActions)
+		})
+	}
+}
+
 func TestMachineSetSyncing(t *testing.T) {
 	cases := []struct {
 		name              string
@@ -116,12 +204,11 @@ func TestMachineSetSyncing(t *testing.T) {
 		errorExpected     string
 		expectedActions   []expectedRemoteAction
 		unexpectedActions []expectedRemoteAction
-		cluster           *cov1.ClusterDeployment
+		clusterDeployment *cov1.ClusterDeployment
 		remoteMachineSets []clusterapiv1.MachineSet
 	}{
 		{
-			name:              "no-op when control plane not yet ready",
-			controlPlaneReady: false,
+			name: "no-op when control plane not yet ready",
 			unexpectedActions: []expectedRemoteAction{
 				{
 					namespace: remoteClusterAPINamespace,
@@ -129,11 +216,10 @@ func TestMachineSetSyncing(t *testing.T) {
 					gvr:       clusterapiv1.SchemeGroupVersion.WithResource("machinesets"),
 				},
 			},
-			cluster: newTestCluster(),
+			clusterDeployment: newTestClusterDeployment(false),
 		},
 		{
-			name:              "creates initial machine set",
-			controlPlaneReady: true,
+			name: "creates initial machine set",
 			expectedActions: []expectedRemoteAction{
 				{
 					namespace: remoteClusterAPINamespace,
@@ -141,11 +227,10 @@ func TestMachineSetSyncing(t *testing.T) {
 					gvr:       clusterapiv1.SchemeGroupVersion.WithResource("machinesets"),
 				},
 			},
-			cluster: newTestClusterWithCompute(),
+			clusterDeployment: newTestClusterWithCompute(true),
 		},
 		{
-			name:              "no-op when machineset already on remote",
-			controlPlaneReady: true,
+			name: "no-op when machineset already on remote",
 			unexpectedActions: []expectedRemoteAction{
 				{
 					namespace: remoteClusterAPINamespace,
@@ -153,7 +238,7 @@ func TestMachineSetSyncing(t *testing.T) {
 					gvr:       clusterapiv1.SchemeGroupVersion.WithResource("machinesets"),
 				},
 			},
-			cluster: newTestClusterWithCompute(),
+			clusterDeployment: newTestClusterWithCompute(true),
 			remoteMachineSets: []clusterapiv1.MachineSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -167,8 +252,7 @@ func TestMachineSetSyncing(t *testing.T) {
 			},
 		},
 		{
-			name:              "update when remote machineset is outdated",
-			controlPlaneReady: true,
+			name: "update when remote machineset is outdated",
 			expectedActions: []expectedRemoteAction{
 				{
 					namespace: remoteClusterAPINamespace,
@@ -176,7 +260,7 @@ func TestMachineSetSyncing(t *testing.T) {
 					gvr:       clusterapiv1.SchemeGroupVersion.WithResource("machinesets"),
 				},
 			},
-			cluster: newTestClusterWithCompute(),
+			clusterDeployment: newTestClusterWithCompute(true),
 			remoteMachineSets: []clusterapiv1.MachineSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -190,8 +274,7 @@ func TestMachineSetSyncing(t *testing.T) {
 			},
 		},
 		{
-			name:              "create when additional machineset appears",
-			controlPlaneReady: true,
+			name: "create when additional machineset appears",
 			expectedActions: []expectedRemoteAction{
 				{
 					namespace: remoteClusterAPINamespace,
@@ -199,8 +282,8 @@ func TestMachineSetSyncing(t *testing.T) {
 					gvr:       clusterapiv1.SchemeGroupVersion.WithResource("machinesets"),
 				},
 			},
-			cluster: func() *cov1.ClusterDeployment {
-				cluster := newTestClusterWithCompute()
+			clusterDeployment: func() *cov1.ClusterDeployment {
+				cluster := newTestClusterWithCompute(true)
 				cluster = addMachineSetToCluster(cluster, "compute2", cov1.NodeTypeCompute, false, 1)
 				return cluster
 			}(),
@@ -217,8 +300,7 @@ func TestMachineSetSyncing(t *testing.T) {
 			},
 		},
 		{
-			name:              "delete extra remote machineset",
-			controlPlaneReady: true,
+			name: "delete extra remote machineset",
 			expectedActions: []expectedRemoteAction{
 				{
 					namespace: remoteClusterAPINamespace,
@@ -226,7 +308,7 @@ func TestMachineSetSyncing(t *testing.T) {
 					gvr:       clusterapiv1.SchemeGroupVersion.WithResource("machinesets"),
 				},
 			},
-			cluster: newTestClusterWithCompute(),
+			clusterDeployment: newTestClusterWithCompute(true),
 			remoteMachineSets: []clusterapiv1.MachineSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -274,22 +356,15 @@ func TestMachineSetSyncing(t *testing.T) {
 				return remoteClusterAPIClient, nil
 			}
 
-			if tc.controlPlaneReady {
-				tc.cluster.Status.ClusterAPIInstalled = true
-				tc.cluster.Status.ControlPlaneInstalled = true
-			}
-
 			// create cluster api cluster object
-			capiCluster := newCapiCluster(tc.cluster)
-			providerStatus, err := controller.ClusterAPIProviderStatusFromClusterStatus(&tc.cluster.Status)
+			capiCluster, err := newCapiCluster(tc.clusterDeployment)
 			if err != nil {
-				t.Fatalf("failed to get providerstaus from clusterdeployment")
+				t.Fatalf("failed to get providerstaus from clusterdeployment: %v", err)
 			}
-			capiCluster.Status.ProviderStatus = providerStatus
 			ctx.clusterStore.Add(capiCluster)
 
-			ctx.clusterDeploymentStore.Add(tc.cluster)
-			err = ctx.controller.syncClusterDeployment(getKey(tc.cluster, t))
+			ctx.clusterDeploymentStore.Add(tc.clusterDeployment)
+			err = ctx.controller.syncClusterDeployment(getKey(tc.clusterDeployment, t))
 
 			if tc.errorExpected != "" {
 				if assert.Error(t, err) {
@@ -316,6 +391,9 @@ func validateExpectedActions(t *testing.T, tLog log.FieldLogger, actions []clien
 				found = true
 			}
 		}
+		if !found {
+			anyMissing = true
+		}
 		assert.True(t, found, "unable to find expected remote client action: %v", ea)
 	}
 	if anyMissing {
@@ -324,11 +402,11 @@ func validateExpectedActions(t *testing.T, tLog log.FieldLogger, actions []clien
 }
 
 func validateUnexpectedActions(t *testing.T, tLog log.FieldLogger, actions []clientgotesting.Action, unexpectedActions []expectedRemoteAction) {
-	for _, ea := range unexpectedActions {
+	for _, uea := range unexpectedActions {
 		for _, a := range actions {
-			if a.GetNamespace() == ea.namespace &&
-				a.GetResource() == ea.gvr &&
-				a.GetVerb() == ea.verb {
+			if a.GetNamespace() == uea.namespace &&
+				a.GetResource() == uea.gvr &&
+				a.GetVerb() == uea.verb {
 				t.Errorf("found unexpected remote client action: %v", a)
 			}
 		}
@@ -354,7 +432,7 @@ func getKey(cluster *cov1.ClusterDeployment, t *testing.T) string {
 	return key
 }
 
-func newCapiCluster(clusterDeployment *cov1.ClusterDeployment) *clusterapiv1.Cluster {
+func newCapiCluster(clusterDeployment *cov1.ClusterDeployment) (*clusterapiv1.Cluster, error) {
 	cluster := &clusterapiv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      clusterDeployment.Name,
@@ -373,7 +451,13 @@ func newCapiCluster(clusterDeployment *cov1.ClusterDeployment) *clusterapiv1.Clu
 		},
 	}
 
-	return cluster
+	providerStatus, err := controller.ClusterAPIProviderStatusFromClusterStatus(&clusterDeployment.Status)
+	if err != nil {
+		return nil, err
+	}
+	cluster.Status.ProviderStatus = providerStatus
+
+	return cluster, nil
 }
 
 // newClusterVer will create an actual ClusterVersion for the given reference.
@@ -402,21 +486,14 @@ func newClusterVer(namespace, name string, uid types.UID) *cov1.ClusterVersion {
 	return cv
 }
 
-func newAPIReadyTestCluster() *cov1.ClusterDeployment {
-	cluster := newTestCluster()
-	cluster.Status.ClusterAPIInstalled = true
-	cluster.Status.ControlPlaneInstalled = true
-	return cluster
-}
-
-func newTestClusterWithCompute() *cov1.ClusterDeployment {
-	cluster := newTestCluster()
+func newTestClusterWithCompute(controlPlaneReady bool) *cov1.ClusterDeployment {
+	cluster := newTestClusterDeployment(controlPlaneReady)
 	cluster = addMachineSetToCluster(cluster, "compute", cov1.NodeTypeCompute, false, 1)
 	return cluster
 }
 
-func newTestCluster() *cov1.ClusterDeployment {
-	cluster := &cov1.ClusterDeployment{
+func newTestClusterDeployment(controlPlaneReady bool) *cov1.ClusterDeployment {
+	clusterDeployment := &cov1.ClusterDeployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testClusterName,
 			Namespace: testClusterNamespace,
@@ -443,8 +520,12 @@ func newTestCluster() *cov1.ClusterDeployment {
 				Namespace: testClusterVerNS,
 			},
 		},
+		Status: cov1.ClusterDeploymentStatus{
+			ClusterAPIInstalled:   controlPlaneReady,
+			ControlPlaneInstalled: controlPlaneReady,
+		},
 	}
-	return cluster
+	return clusterDeployment
 }
 
 func addMachineSetToCluster(cluster *cov1.ClusterDeployment, shortName string, nodeType cov1.NodeType, infra bool, size int) *cov1.ClusterDeployment {
