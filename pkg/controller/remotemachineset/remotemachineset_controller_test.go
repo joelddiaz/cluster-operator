@@ -109,7 +109,7 @@ func setupTest() *testContext {
 	return ctx
 }
 
-func TestMachineSetSynching(t *testing.T) {
+func TestMachineSetSyncing(t *testing.T) {
 	cases := []struct {
 		name              string
 		controlPlaneReady bool

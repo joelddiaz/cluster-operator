@@ -86,6 +86,7 @@ func NewController(
 		logger:     logger,
 	}
 
+	// handers/informers for clusteroperator.ClusterDeployment
 	clusterDeploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addClusterDeployment,
 		UpdateFunc: c.updateClusterDeployment,
@@ -95,6 +96,11 @@ func NewController(
 
 	c.clusterVersionInformer = clusterVersionInformer.Lister()
 
+	// handlers/informer for clusterapi.Cluster
+	clusterInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.addCluster,
+		UpdateFunc: c.updateCluster,
+	})
 	c.clusterInformer = clusterInformer.Lister()
 
 	c.syncHandler = c.syncClusterDeployment
@@ -139,15 +145,37 @@ type Controller struct {
 }
 
 func (c *Controller) addClusterDeployment(obj interface{}) {
-	cluster := obj.(*cov1.ClusterDeployment)
-	c.logger.Debugf("remotemachineset: adding cluster %v", cluster.Name)
-	c.enqueueClusterDeployment(cluster)
+	clusterDeployment := obj.(*cov1.ClusterDeployment)
+	c.logger.Debugf("remotemachineset: adding ClusterDeployment %v", clusterDeployment.Name)
+	c.enqueueClusterDeployment(clusterDeployment)
 }
 
 func (c *Controller) updateClusterDeployment(old, cur interface{}) {
-	cluster := cur.(*cov1.ClusterDeployment)
-	c.logger.Debugf("remotemachineset: updating cluster %v", cluster.Name)
-	c.enqueueClusterDeployment(cluster)
+	clusterDeployment := cur.(*cov1.ClusterDeployment)
+	c.logger.Debugf("remotemachineset: updating ClusterDeployment %v", clusterDeployment.Name)
+	c.enqueueClusterDeployment(clusterDeployment)
+}
+
+func (c *Controller) addCluster(obj interface{}) {
+	cluster := obj.(*clusterapiv1.Cluster)
+	c.logger.Debugf("remotemachineset: adding clusterapi.Cluster %v", cluster.Name)
+	clusterDeployment, err := controller.ClusterDeploymentForCluster(cluster, c.clusterDeploymentLister)
+	if err != nil {
+		c.logger.Errorf("error retrieving clusterDeployment from cluster: %v", err)
+	} else {
+		c.enqueueClusterDeployment(clusterDeployment)
+	}
+}
+
+func (c *Controller) updateCluster(old, cur interface{}) {
+	cluster := cur.(*clusterapiv1.Cluster)
+	c.logger.Debugf("remotemachineset: adding clusterapi.Cluster %v", cluster.Name)
+	clusterDeployment, err := controller.ClusterDeploymentForCluster(cluster, c.clusterDeploymentLister)
+	if err != nil {
+		c.logger.Errorf("error retrieving clusterDeployment from cluster: %v", err)
+	} else {
+		c.enqueueClusterDeployment(clusterDeployment)
+	}
 }
 
 // Run runs c; will not return until stopCh is closed. workers determines how
@@ -177,7 +205,6 @@ func (c *Controller) enqueue(clusterDeployment *cov1.ClusterDeployment) {
 		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", clusterDeployment, err))
 		return
 	}
-	c.logger.Debugf("XXX adding cluster %v", key)
 	c.queue.Add(key)
 }
 
